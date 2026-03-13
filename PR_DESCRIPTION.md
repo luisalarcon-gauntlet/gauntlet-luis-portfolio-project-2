@@ -1,0 +1,275 @@
+# PR: Monorepo Infrastructure Setup
+
+## Summary
+
+This PR establishes the complete monorepo infrastructure for the Luis Alarcon Portfolio project. It creates the folder structure, production-ready Dockerfiles for both frontend and backend services, a comprehensive docker-compose.yml configuration, and minimal application scaffolds. All components have been verified to run natively before Docker containerization.
+
+## Prior Work
+
+First PR — no prior work. This is the initial infrastructure setup.
+
+## What Was Built
+
+### Directory Structure
+- **`frontend/`** — Next.js 14 application with App Router, TypeScript, and Tailwind CSS
+- **`backend/`** — FastAPI application with proper package structure
+- **`db/`** — Database migrations and seeds directory (ready for Agent 2)
+- **`docs/`** — Documentation directory
+
+### Docker Infrastructure
+
+#### `docker-compose.yml`
+- Three services: `db` (PostgreSQL 16.3-alpine), `backend` (FastAPI), `frontend` (Next.js)
+- Health checks configured for all services with proper intervals and timeouts
+- `depends_on` with `service_healthy` conditions ensuring proper startup order
+- Explicit bridge network (`portfolio_net`) for service communication
+- Named volume (`postgres_data`) for database persistence
+- Environment variable injection via `env_file` and `environment` blocks
+- Container names for readable logs: `portfolio_db`, `portfolio_backend`, `portfolio_frontend`
+- Restart policies: `unless-stopped` for all services
+
+#### `backend/Dockerfile`
+- **Base image**: `python:3.11.10-slim-bookworm` (pinned version)
+- **Multi-stage build**: Three stages (deps → builder → runner)
+- **Non-root user**: `appuser` in `appgroup`
+- **Health check**: `curl -f http://localhost:8000/api/health`
+- **Layer optimization**: Dependencies installed before source code copy
+- **Security**: No secrets in Dockerfile, all via environment variables
+
+#### `frontend/Dockerfile`
+- **Base image**: `node:20.14.0-alpine3.20` (pinned version)
+- **Multi-stage build**: Three stages (deps → builder → runner)
+- **Non-root user**: `nextjs` in `nodejs` group
+- **Next.js standalone output**: Optimized production build
+- **Build args**: `NEXT_PUBLIC_API_URL` passed at build time
+- **Health check**: `curl -f http://localhost:3000/`
+- **Layer optimization**: Package files copied before source code
+
+#### `.dockerignore` Files
+- **`backend/.dockerignore`**: Excludes `.env`, `__pycache__/`, `*.pyc`, `.git/`, etc.
+- **`frontend/.dockerignore`**: Excludes `.env`, `node_modules/`, `.next/`, `.git/`, etc.
+
+### Backend Scaffold
+
+#### `backend/app/main.py`
+- FastAPI application with proper metadata
+- `/api/health` endpoint returning standard response envelope: `{"data": {"status": "ok"}, "error": null}`
+- CORS middleware configured for `http://localhost:3000`
+- Global exception handler returning standard error envelope
+- Package structure: `app/routers/`, `app/services/`, `app/models/`, `app/schemas/`, `app/db/`
+
+#### `backend/requirements.txt`
+- Pinned versions for all dependencies:
+  - `fastapi==0.115.0`
+  - `uvicorn[standard]==0.32.0`
+  - `httpx==0.27.2`
+  - `sqlalchemy==2.0.36`
+  - `asyncpg==0.30.0`
+  - `pydantic==2.9.2`
+  - `pydantic-settings==2.5.2`
+  - `python-dotenv==1.0.1`
+
+### Frontend Scaffold
+
+#### `frontend/app/`
+- **`layout.tsx`**: Root layout with dark theme (`bg-[#0a0a0a]`), metadata, and HTML structure
+- **`page.tsx`**: Minimal home page with "Portfolio" heading
+- **`globals.css`**: Tailwind CSS imports
+
+#### Configuration Files
+- **`package.json`**: Next.js 14.2.19, React 18.3.1, TypeScript 5.6.2, Tailwind CSS 3.4.14
+- **`tsconfig.json`**: Strict TypeScript configuration with path aliases (`@/*`)
+- **`next.config.js`**: Standalone output mode for Docker optimization
+- **`tailwind.config.ts`**: Dark mode enabled, content paths configured
+- **`postcss.config.js`**: Tailwind and Autoprefixer plugins
+
+### Environment Configuration
+
+#### `.env.example`
+- All required environment variables documented:
+  - Database: `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_HOST`, `POSTGRES_PORT`
+  - Backend: `DATABASE_URL`, `GITHUB_USERNAME`, `GITHUB_TOKEN`, `CACHE_TTL_MINUTES`, `JWT_SECRET`, `ENVIRONMENT`
+  - Frontend: `NEXT_PUBLIC_API_URL`, `BACKEND_PORT`, `FRONTEND_PORT`
+
+#### `.env`
+- Copied from `.env.example` with safe development defaults
+- Added to `.gitignore` (not committed)
+
+#### `.gitignore`
+- Comprehensive ignore patterns for Python, Node.js, environment files, IDE files, and build artifacts
+
+## Decisions Made
+
+### 1. Pinned Base Image Versions
+**Decision**: Use specific, pinned versions for all base images (e.g., `python:3.11.10-slim-bookworm`, `node:20.14.0-alpine3.20`, `postgres:16.3-alpine`)
+
+**Rationale**: 
+- Ensures reproducible builds across environments
+- Prevents unexpected breaking changes from `latest` tags
+- Aligns with Docker best practices and security scanning requirements
+- Matches the `.cursor/rules/docker.mdc` requirements
+
+### 2. Multi-Stage Docker Builds
+**Decision**: Use three-stage builds for both frontend and backend
+
+**Rationale**:
+- Minimizes final image size by excluding build dependencies
+- Separates concerns: dependency installation → build → runtime
+- Reduces attack surface in production images
+- Follows industry best practices for containerized applications
+
+### 3. Non-Root Users
+**Decision**: Run both backend and frontend containers as non-root users (`appuser` and `nextjs`)
+
+**Rationale**:
+- Security best practice: reduces impact of container escape vulnerabilities
+- Required by `.cursor/rules/docker.mdc`
+- Industry standard for production containers
+
+### 4. Health Checks with Service Dependencies
+**Decision**: Use `depends_on` with `condition: service_healthy` for all service dependencies
+
+**Rationale**:
+- Ensures services only start when dependencies are actually ready
+- Prevents race conditions during startup
+- Required by `.cursor/rules/docker.mdc`
+- Provides reliable startup ordering: `db` → `backend` → `frontend`
+
+### 5. Explicit Network Configuration
+**Decision**: Create explicit bridge network (`portfolio_net`) instead of using default
+
+**Rationale**:
+- Better isolation and control over service communication
+- Makes network topology explicit in configuration
+- Easier to debug and understand service relationships
+- Required by `.cursor/rules/docker.mdc`
+
+### 6. Next.js Standalone Output
+**Decision**: Configure Next.js with `output: "standalone"` in `next.config.js`
+
+**Rationale**:
+- Creates minimal production server with only necessary files
+- Reduces Docker image size significantly
+- Recommended by Next.js for containerized deployments
+- Simplifies Dockerfile COPY operations
+
+### 7. FastAPI Response Envelope
+**Decision**: Implement standard response envelope `{"data": {}, "error": null}` from the start
+
+**Rationale**:
+- Consistent API response format across all endpoints
+- Required by `.cursor/rules/api-design.mdc`
+- Makes error handling predictable for frontend
+- Sets foundation for all future API endpoints
+
+### 8. TypeScript Config File Format
+**Decision**: Use `next.config.js` instead of `next.config.ts`
+
+**Rationale**:
+- Next.js 14.2.19 does not support TypeScript config files
+- Discovered during native verification
+- JavaScript config is fully supported and sufficient
+
+### 9. Database URL Format
+**Decision**: Use `postgresql+asyncpg://` in `DATABASE_URL` for async SQLAlchemy
+
+**Rationale**:
+- FastAPI uses async SQLAlchemy (`AsyncSession`)
+- `asyncpg` is the recommended async PostgreSQL driver
+- Required by `.cursor/rules/db.mdc` for async sessions
+
+## Verification
+
+### Native Backend Test
+```bash
+cd backend
+pip3 install --user -r requirements.txt
+python3 -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+curl http://127.0.0.1:8000/api/health
+```
+
+**Result**: ✅ Success
+- Response: `{"data":{"status":"ok"},"error":null}`
+- HTTP Status: 200
+- All dependencies installed correctly
+
+### Native Frontend Test
+```bash
+cd frontend
+npm install
+npm run dev
+curl http://127.0.0.1:3000
+```
+
+**Result**: ✅ Success
+- HTML page loads with "Portfolio" heading
+- Dark theme applied (`bg-[#0a0a0a]`)
+- Tailwind CSS working correctly
+- Next.js dev server running on port 3000
+
+## Docker Verification (Not Run)
+
+Per instructions, Dockerfiles and docker-compose.yml are deliverables but were **not run in this environment**. They have been written according to all rules in `.cursor/rules/docker.mdc`:
+
+- ✅ Pinned base images (no `latest` tags)
+- ✅ Multi-stage builds
+- ✅ Non-root users
+- ✅ Health checks configured
+- ✅ Proper `depends_on` with `service_healthy`
+- ✅ Explicit networks and volumes
+- ✅ No secrets in Dockerfiles
+- ✅ `.dockerignore` files present
+
+## Known Limitations
+
+1. **No database schema yet**: Tables will be created by Agent 2 (Database Schema & Migrations)
+2. **No GitHub API integration**: Backend only has `/api/health` endpoint; repos endpoint will be added by Agent 4
+3. **No frontend components**: Only minimal page scaffold; Hero, Projects, About, Contact sections will be added by later agents
+4. **No authentication**: JWT dependencies not added yet (out of scope for v1 per spec)
+5. **Next.js security warning**: Version 14.2.19 still shows audit warning; will be addressed in future updates
+
+## How to Test Manually
+
+### Prerequisites
+- Docker and docker-compose installed
+- `.env` file created from `.env.example` with appropriate values
+
+### Steps
+
+1. **Start all services**:
+   ```bash
+   docker-compose up --build
+   ```
+
+2. **Verify database health**:
+   ```bash
+   docker exec portfolio_db pg_isready -U postgres -d luis-portfolio-project
+   ```
+
+3. **Verify backend health**:
+   ```bash
+   curl http://localhost:8000/api/health
+   # Expected: {"data":{"status":"ok"},"error":null}
+   ```
+
+4. **Verify frontend loads**:
+   ```bash
+   curl http://localhost:3000
+   # Expected: HTML with "Portfolio" heading
+   ```
+
+5. **Check service status**:
+   ```bash
+   docker-compose ps
+   # All services should show "Up (healthy)"
+   ```
+
+## Next Steps
+
+This PR provides the foundation for:
+- **Agent 2**: Database schema and migrations (Alembic setup, table creation)
+- **Agent 3**: Auth layer (stub only, not implemented in v1)
+- **Agent 4**: Backend API (GitHub API integration, caching logic)
+- **Agent 5+**: Frontend components (Hero, Projects Grid, About, Contact)
+
+All infrastructure is in place and ready for the next agent to build upon.
