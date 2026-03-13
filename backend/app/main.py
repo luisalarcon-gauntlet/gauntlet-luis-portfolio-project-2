@@ -2,10 +2,14 @@
 FastAPI application entry point.
 Minimal scaffold for Agent 1 - Environment & Infrastructure.
 """
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from fastapi import Request
+from fastapi import Request, Depends
+
+from app.routers import auth
+from app.dependencies import get_current_user
+from app.models.user import User
 
 app = FastAPI(
     title="Luis Alarcon Portfolio API",
@@ -21,6 +25,18 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Register routers
+app.include_router(auth.router)
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """HTTPException handler returning standard envelope format."""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"data": None, "error": exc.detail},
+    )
 
 
 @app.exception_handler(Exception)
@@ -39,3 +55,12 @@ async def health():
     Returns standard API response envelope.
     """
     return {"data": {"status": "ok"}, "error": None}
+
+
+@app.post("/cache/refresh")
+async def refresh_cache(current_user: User = Depends(get_current_user)):
+    """
+    Protected endpoint for cache refresh.
+    Requires JWT authentication.
+    """
+    return {"data": {"refreshed": True}, "error": None}
