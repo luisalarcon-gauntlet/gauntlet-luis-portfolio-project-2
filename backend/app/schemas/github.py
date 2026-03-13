@@ -1,10 +1,9 @@
 """
 Pydantic schemas for GitHub-related endpoints.
 """
-from datetime import datetime
 from typing import List, Optional
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 
 
 class RepoSchema(BaseModel):

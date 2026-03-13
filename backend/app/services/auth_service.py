@@ -1,7 +1,7 @@
 """
 Authentication service - JWT and password hashing.
 """
-from datetime import datetime, timedelta
+from datetime import timedelta
 from typing import Optional
 
 from jose import JWTError, jwt
@@ -24,6 +24,8 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 def create_access_token(user_id: str) -> str:
     """Create a JWT access token for a user."""
+    from datetime import datetime
+    
     expire = datetime.utcnow() + timedelta(minutes=settings.access_token_expire_minutes)
     payload = {
         "sub": str(user_id),

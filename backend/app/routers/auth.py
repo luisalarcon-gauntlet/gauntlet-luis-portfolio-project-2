@@ -5,15 +5,15 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from app.core.config import settings
 from app.db.session import get_db
 from app.models.user import User
-from app.schemas.auth import UserRegister, UserLogin, TokenResponse, UserPublic
+from app.schemas.auth import UserRegister, UserLogin
 from app.services.auth_service import (
     hash_password,
     verify_password,
     create_access_token,
 )
-from app.core.config import settings
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -21,11 +21,6 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 def success(data) -> dict:
     """Helper to return success response envelope."""
     return {"data": data, "error": None}
-
-
-def error(message: str) -> dict:
-    """Helper to return error response envelope."""
-    return {"data": None, "error": message}
 
 
 @router.post("/register", response_model=dict)

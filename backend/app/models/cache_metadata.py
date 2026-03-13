@@ -1,8 +1,7 @@
 """
 Cache metadata model for tracking GitHub API fetch state.
 """
-from sqlalchemy import Column, Integer, String
-from sqlalchemy import DateTime
+from sqlalchemy import Column, DateTime, Integer, String
 
 from app.models.base import Base, TimestampMixin, UUIDMixin
 

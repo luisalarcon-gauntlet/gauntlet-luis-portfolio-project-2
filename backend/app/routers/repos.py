@@ -2,16 +2,14 @@
 Router for repository endpoints.
 """
 from datetime import datetime, timedelta
-from typing import Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.db.session import get_db
-from app.schemas.github import RepoDetailResponse, ReposListResponse
-from app.services import github_service
-import httpx
 from app.core.config import settings
+from app.db.session import get_db
+from app.services import github_service
 
 router = APIRouter(prefix="/repos", tags=["repos"])
 
@@ -19,11 +17,6 @@ router = APIRouter(prefix="/repos", tags=["repos"])
 def success(data):
     """Helper function for success response."""
     return {"data": data, "error": None}
-
-
-def error(message: str):
-    """Helper function for error response."""
-    return {"data": None, "error": message}
 
 
 @router.get("", response_model=dict)
