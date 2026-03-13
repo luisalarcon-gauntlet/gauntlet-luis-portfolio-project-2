@@ -1,0 +1,455 @@
+---
+description: Docker and docker-compose rules
+globs: ["Dockerfile", "docker-compose.yml", "docker-compose*.yml"]
+alwaysApply: true
+---
+
+# Docker Rules — Luis Alarcon Portfolio
+
+## Non-Negotiable Build Gate
+
+Every single layer of the stack **must pass `docker-compose up --build`** before any handoff.
+No exceptions. If the build fails, the feature is not done.
+
+```bash
+# Required verification command before every handoff
+docker-compose up --build --abort-on-container-exit
+```
+
+If any service fails to start, crashes, or fails its health check, the handoff is **blocked**.
+
+---
+
+## docker-compose.yml Rules
+
+### Services
+
+The `docker-compose.yml` must define exactly these services for this project:
+
+- `frontend` — Next.js app
+- `backend` — FastAPI app
+- `db` — PostgreSQL database
+
+Each service must have:
+- An explicit `build` context or a pinned image tag (no `latest`)
+- A `container_name` for readable logs
+- A `restart: unless-stopped` policy
+- A `networks` assignment to the shared app network
+- Resource limits defined under `deploy.resources` (optional in dev, required in prod compose)
+
+```yaml
+# Example service skeleton
+services:
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: portfolio_backend
+    restart: unless-stopped
+    networks:
+      - portfolio_net
+```
+
+### Health Checks
+
+Every service **must define a `healthcheck`**. No service may use `depends_on` without a
+condition tied to that health check.
+
+```yaml
+# PostgreSQL health check
+db:
+  image: postgres:16.3-alpine
+  container_name: portfolio_db
+  healthcheck:
+    test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+    interval: 10s
+    timeout: 5s
+    retries: 5
+    start_period: 10s
+
+# FastAPI health check
+backend:
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+    interval: 15s
+    timeout: 5s
+    retries: 3
+    start_period: 20s
+
+# Next.js health check
+frontend:
+  healthcheck:
+    test: ["CMD", "curl", "-f", "http://localhost:3000/"]
+    interval: 15s
+    timeout: 5s
+    retries: 3
+    start_period: 30s
+```
+
+### depends_on
+
+Never use bare `depends_on` with just a service name. Always use `condition: service_healthy`
+to enforce startup ordering:
+
+```yaml
+# WRONG — do not do this
+depends_on:
+  - db
+
+# CORRECT — always use health condition
+depends_on:
+  db:
+    condition: service_healthy
+  backend:
+    condition: service_healthy
+```
+
+Startup order must be: `db` → `backend` → `frontend`
+
+### Networks
+
+All services must share one explicit bridge network. Do not use the default compose network.
+
+```yaml
+networks:
+  portfolio_net:
+    driver: bridge
+```
+
+### Volumes
+
+The Postgres data volume must be named and declared explicitly:
+
+```yaml
+volumes:
+  postgres_data:
+    driver: local
+
+# Usage in db service
+volumes:
+  - postgres_data:/var/lib/postgresql/data
+```
+
+---
+
+## Dockerfile Rules
+
+### Pinned Base Image Versions
+
+**Never use `latest` or unversioned tags.** Every `FROM` instruction must reference a specific,
+pinned version. This applies to all stages including builder stages.
+
+```dockerfile
+# WRONG
+FROM node:latest
+FROM python:3.12
+FROM postgres:latest
+
+# CORRECT
+FROM node:20.14.0-alpine3.20
+FROM python:3.12.4-slim-bookworm
+FROM postgres:16.3-alpine
+```
+
+Prefer `-alpine` or `-slim` variants to minimize image size and attack surface.
+
+### Multi-Stage Builds
+
+Both the `frontend` and `backend` Dockerfiles must use multi-stage builds to separate build
+dependencies from the final runtime image.
+
+```dockerfile
+# Frontend example structure
+FROM node:20.14.0-alpine3.20 AS deps
+# install only production deps
+
+FROM node:20.14.0-alpine3.20 AS builder
+# build the Next.js app
+
+FROM node:20.14.0-alpine3.20 AS runner
+# copy only built output — no dev deps, no source
+```
+
+### Non-Root User
+
+**Every Dockerfile must create and switch to a non-root user before the final `CMD` or
+`ENTRYPOINT`.** Running as root inside a container is not allowed.
+
+```dockerfile
+# Backend (FastAPI)
+RUN addgroup --system appgroup && adduser --system --ingroup appgroup appuser
+USER appuser
+
+# Frontend (Next.js)
+RUN addgroup --system nodejs && adduser --system --ingroup nodejs nextjs
+USER nextjs
+```
+
+The non-root user must own the application directory:
+
+```dockerfile
+RUN chown -R appuser:appgroup /app
+```
+
+### Layer Caching Optimization
+
+Copy dependency manifests before source code to maximize layer cache hits:
+
+```dockerfile
+# CORRECT — cache deps layer independently
+COPY package.json package-lock.json ./
+RUN npm ci --only=production
+
+COPY . .
+RUN npm run build
+
+# WRONG — invalidates cache on every source change
+COPY . .
+RUN npm ci && npm run build
+```
+
+### No Secrets in Dockerfiles
+
+Never `COPY` `.env` files into an image. Never hardcode credentials, tokens, or API keys in
+any `ENV` instruction inside a Dockerfile.
+
+```dockerfile
+# WRONG — never do this
+ENV GITHUB_TOKEN=ghp_abc123
+COPY .env /app/.env
+
+# CORRECT — pass at runtime via docker-compose env_file or environment
+```
+
+### .dockerignore Required
+
+Every service directory with a Dockerfile must have a `.dockerignore` file. At minimum it must
+exclude:
+
+```
+.env
+.env.*
+node_modules/
+__pycache__/
+*.pyc
+.git/
+.gitignore
+README.md
+docker-compose*.yml
+*.log
+.DS_Store
+```
+
+---
+
+## Environment Variable Rules
+
+### Never Hardcode Values
+
+All configuration that varies between environments (dev/prod) must come from environment
+variables. No connection strings, ports, usernames, or tokens may be hardcoded in source files
+or Dockerfiles.
+
+### .env File Structure
+
+A `.env.example` file must exist at the repo root with every required variable listed with a
+placeholder value. The actual `.env` file must be in `.gitignore` and never committed.
+
+```bash
+# .env.example — commit this
+POSTGRES_USER=your_db_user
+POSTGRES_PASSWORD=your_db_password
+POSTGRES_DB=portfolio_db
+POSTGRES_HOST=db
+POSTGRES_PORT=5432
+
+GITHUB_USERNAME=luisalarcon-gauntlet
+GITHUB_API_BASE=https://api.github.com
+GITHUB_TOKEN=optional_for_higher_rate_limits
+
+NEXT_PUBLIC_API_URL=http://localhost:8000
+BACKEND_PORT=8000
+FRONTEND_PORT=3000
+```
+
+### docker-compose Environment Injection
+
+Use `env_file` to load the `.env` file. Use `environment` only for values that need to be
+explicitly overridden or derived per-service.
+
+```yaml
+services:
+  backend:
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:${POSTGRES_PORT}/${POSTGRES_DB}
+
+  db:
+    env_file:
+      - .env
+    environment:
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DB=${POSTGRES_DB}
+```
+
+### NEXT_PUBLIC_ Variables
+
+Next.js public environment variables (exposed to the browser) must be prefixed with
+`NEXT_PUBLIC_`. They are baked in at build time and must be passed as `build.args` in
+docker-compose, not just at runtime.
+
+```yaml
+frontend:
+  build:
+    context: ./frontend
+    dockerfile: Dockerfile
+    args:
+      - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL}
+```
+
+```dockerfile
+# In frontend Dockerfile builder stage
+ARG NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+```
+
+---
+
+## Verification Checklist — Must Pass Before Every Handoff
+
+Run through every item below in order. All items must pass. Document any failures and fix
+before submitting.
+
+### 1. Clean Build
+
+```bash
+# Remove all cached layers and volumes, build from scratch
+docker-compose down -v --remove-orphans
+docker-compose build --no-cache
+```
+
+- [ ] `docker-compose build --no-cache` exits with code `0`
+- [ ] No `ERROR` lines in build output
+- [ ] No use of `latest` tag appears in any build output
+
+### 2. Full Stack Starts
+
+```bash
+docker-compose up -d
+sleep 30  # allow start_period for health checks
+```
+
+- [ ] All three containers reach status `healthy` (not `starting`, not `unhealthy`)
+- [ ] `docker-compose ps` shows all services as `Up (healthy)`
+
+```bash
+# Verify all healthy
+docker-compose ps | grep -v "healthy" | grep -v "Name"
+# Output should be empty — any line here is a failure
+```
+
+### 3. Service Endpoint Checks
+
+```bash
+# Backend health endpoint
+curl -f http://localhost:8000/health
+# Expected: HTTP 200 with JSON body
+
+# Backend repos endpoint (core feature)
+curl -f http://localhost:8000/repos
+# Expected: HTTP 200 with JSON array of repositories
+
+# Frontend loads
+curl -f http://localhost:3000/
+# Expected: HTTP 200 with HTML body
+```
+
+- [ ] `GET /health` returns `200`
+- [ ] `GET /repos` returns `200` with a non-empty JSON array
+- [ ] `GET localhost:3000/` returns `200`
+
+### 4. Database Connectivity
+
+```bash
+docker exec portfolio_db pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}
+```
+
+- [ ] Output includes `accepting connections`
+- [ ] Backend logs show successful DB connection on startup (no `FATAL` or `connection refused`)
+
+### 5. GitHub API Cache Behavior
+
+```bash
+# First request — should hit GitHub API and populate cache
+curl -f http://localhost:8000/repos
+
+# Second request — should return cached data from Postgres
+curl -f http://localhost:8000/repos
+```
+
+- [ ] Both requests return `200`
+- [ ] Backend logs confirm cache hit on second request (no second GitHub API call)
+- [ ] `docker logs portfolio_backend` contains no `rate limit` errors
+
+### 6. Non-Root User Verification
+
+```bash
+docker exec portfolio_backend whoami
+docker exec portfolio_frontend whoami
+```
+
+- [ ] Neither service returns `root`
+
+### 7. No Secrets Leaked
+
+```bash
+# Inspect built images for secrets
+docker inspect portfolio_backend | grep -i "token\|password\|secret"
+docker inspect portfolio_frontend | grep -i "token\|password\|secret"
+```
+
+- [ ] No real secret values appear in image inspect output
+- [ ] `.env` file is not present inside any container:
+
+```bash
+docker exec portfolio_backend ls /app/.env 2>&1 | grep "No such file"
+docker exec portfolio_frontend ls /app/.env 2>&1 | grep "No such file"
+```
+
+### 8. Clean Shutdown and Restart
+
+```bash
+docker-compose down
+docker-compose up -d
+sleep 30
+docker-compose ps
+```
+
+- [ ] All services return to `healthy` after restart with no manual intervention
+- [ ] Postgres data persists across restart (named volume preserved)
+
+### 9. Log Sanity Check
+
+```bash
+docker-compose logs --no-color 2>&1 | grep -iE "error|exception|traceback|fatal" \
+  | grep -v "healthcheck"
+```
+
+- [ ] Output is empty or contains only expected/ignorable startup messages
+- [ ] No Python tracebacks in backend logs
+- [ ] No Next.js build errors in frontend logs
+
+### 10. Final Gate
+
+```bash
+docker-compose down -v --remove-orphans
+docker-compose up --build --abort-on-container-exit
+```
+
+- [ ] Process exits with code `0`
+- [ ] All services started and remained healthy until `--abort-on-container-exit` triggered by
+  natural completion (or no exit at all, meaning all containers are running)
+
+**If any item in this checklist fails, the handoff does not happen.**
