@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     github_username: str = "luisalarcon-gauntlet"
     github_token: str = ""
     cache_ttl_minutes: int = 60
+    
+    # JWT settings
+    secret_key: str
+    algorithm: str = "HS256"
+    access_token_expire_minutes: int = 30
 
     class Config:
         env_file = ".env"
