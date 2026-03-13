@@ -1,0 +1,361 @@
+---
+description: FastAPI backend conventions
+globs: ["backend/**/*.py"]
+alwaysApply: true
+---
+
+# FastAPI Backend Conventions
+
+## Response Shape
+
+Every endpoint MUST return a consistent envelope shape. No exceptions.
+
+```python
+# Always return this structure
+{
+  "data": {},   # null if no data, object or array otherwise
+  "error": null # null on success, string message on failure
+}
+```
+
+Use this shared response model for all endpoints:
+
+```python
+from typing import Any, Optional
+from pydantic import BaseModel
+
+class APIResponse(BaseModel):
+    data: Any = None
+    error: Optional[str] = None
+```
+
+Success response helper:
+```python
+def success(data: Any) -> dict:
+    return {"data": data, "error": None}
+```
+
+Error response helper:
+```python
+def error(message: str) -> dict:
+    return {"data": None, "error": message}
+```
+
+Never return raw Pydantic models directly from route functions. Always wrap in the envelope.
+
+---
+
+## File Structure
+
+```
+backend/
+├── main.py                  # FastAPI app instantiation, router registration, CORS
+├── config.py                # Settings via pydantic-settings (env vars)
+├── database.py              # SQLAlchemy engine, SessionLocal, Base
+├── dependencies.py          # Shared FastAPI dependencies (get_db, get_current_user)
+├── models/
+│   ├── __init__.py
+│   └── github.py            # SQLAlchemy ORM models (e.g., CachedRepo)
+├── schemas/
+│   ├── __init__.py
+│   ├── github.py            # Pydantic request/response schemas
+│   └── auth.py              # Pydantic schemas for auth (TokenResponse, UserCreate)
+├── routers/
+│   ├── __init__.py
+│   ├── github.py            # /api/github routes
+│   └── auth.py              # /api/auth routes (if auth is added in future)
+├── services/
+│   ├── __init__.py
+│   ├── github_service.py    # GitHub API fetch logic, cache logic
+│   └── auth_service.py      # JWT creation, bcrypt hashing (future use)
+└── tests/
+    ├── __init__.py
+    └── test_github.py
+```
+
+- `models/` = SQLAlchemy database models only
+- `schemas/` = Pydantic models only (request bodies, response shapes)
+- `services/` = business logic, external API calls, no HTTP concerns
+- `routers/` = route definitions only, delegate to services
+
+---
+
+## Route Structure and Naming Conventions
+
+All routes are prefixed with `/api`. Router files use `APIRouter` with a consistent prefix and tags.
+
+```python
+# routers/github.py
+from fastapi import APIRouter
+
+router = APIRouter(prefix="/api/github", tags=["github"])
+```
+
+Register all routers in `main.py`:
+```python
+from routers import github, auth
+app.include_router(github.router)
+app.include_router(auth.router)
+```
+
+Route naming rules:
+- Use **kebab-case** for URL paths: `/api/github/cached-repos`
+- Use **plural nouns** for collections: `/repos`, not `/repo`
+- Never embed verbs in route names — the HTTP method is the verb
+- Keep nesting shallow: maximum two levels deep (`/api/github/repos/{repo_id}`)
+
+Examples:
+```
+GET    /api/github/repos           → list all cached repos
+GET    /api/github/repos/{repo_id} → get one repo by id
+POST   /api/github/refresh         → trigger a cache refresh from GitHub API
+GET    /api/health                 → health check
+```
+
+---
+
+## HTTP Method Usage
+
+| Method | Usage |
+|--------|-------|
+| GET    | Read-only data fetching. No side effects. Safe to call repeatedly. |
+| POST   | Create a resource or trigger an action (e.g., cache refresh). |
+| PUT    | Full replacement of an existing resource. |
+| PATCH  | Partial update of an existing resource. |
+| DELETE | Remove a resource. |
+
+Rules:
+- `GET /api/github/repos` returns cached repo list — never hits GitHub API directly per request
+- `POST /api/github/refresh` is the only route that triggers a live GitHub API call
+- Never use `GET` for operations with side effects
+- Return `200` for successful GET/PUT/PATCH, `201` for successful POST creation, `204` for DELETE
+
+---
+
+## FastAPI-Specific Conventions
+
+### Routers
+
+Always use `APIRouter`, never define routes directly on the `app` instance except for `/health`.
+
+```python
+# routers/github.py
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+from dependencies import get_db
+from schemas.github import RepoListResponse
+from services.github_service import get_cached_repos
+
+router = APIRouter(prefix="/api/github", tags=["github"])
+
+@router.get("/repos", response_model=APIResponse)
+def list_repos(db: Session = Depends(get_db)):
+    repos = get_cached_repos(db)
+    return success(repos)
+```
+
+### Pydantic Schemas
+
+- All request bodies and response payloads use Pydantic v2 models in `schemas/`
+- Schema classes use `PascalCase`
+- Never reuse SQLAlchemy models as response schemas — always define a separate Pydantic schema
+- Use `model_config = ConfigDict(from_attributes=True)` on schemas that map from ORM models
+
+```python
+# schemas/github.py
+from pydantic import BaseModel, ConfigDict
+from datetime import datetime
+from typing import Optional, List
+
+class RepoSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    name: str
+    description: Optional[str]
+    language: Optional[str]
+    stars: int
+    updated_at: datetime
+    html_url: str
+    topics: List[str] = []
+```
+
+- Never include raw database IDs in public-facing schemas unless required for linking
+- Use `Optional[str]` not `str | None` for consistency across the codebase
+
+### Dependency Injection
+
+All shared dependencies live in `dependencies.py`. Never inline database session creation inside route functions.
+
+```python
+# dependencies.py
+from database import SessionLocal
+from fastapi import Depends, HTTPException, status
+from fastapi.security import OAuth2PasswordBearer
+from services.auth_service import decode_jwt_token
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/token")
+
+def get_current_user(token: str = Depends(oauth2_scheme), db = Depends(get_db)):
+    user = decode_jwt_token(token, db)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return user
+```
+
+Inject `get_db` into every route that touches the database. Inject `get_current_user` into every protected route.
+
+### Settings and Config
+
+All environment variables are managed via `pydantic-settings` in `config.py`. Never use `os.getenv()` directly inside route or service files.
+
+```python
+# config.py
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    database_url: str
+    github_token: str = ""
+    github_username: str = "luisalarcon-gauntlet"
+    cache_ttl_seconds: int = 3600
+    secret_key: str
+    algorithm: str = "HS256"
+    access_token_expire_minutes: int = 30
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()
+```
+
+Import `settings` wherever config values are needed.
+
+---
+
+## Auth Rules
+
+These rules apply now and must be followed strictly if auth is added in future versions. The architecture must be auth-ready even though v1 does not expose authentication to end users.
+
+### JWT
+
+- Use `python-jose` or `PyJWT` for JWT encoding/decoding
+- Tokens are signed with `HS256` using `settings.secret_key`
+- Access tokens expire in `settings.access_token_expire_minutes` (default 30 minutes)
+- Store only non-sensitive claims in the token payload: `sub` (user id), `exp`, `iat`
+- Never store passwords, roles with sensitive data, or PII in the JWT payload
+
+```python
+# services/auth_service.py
+from datetime import datetime, timedelta
+from jose import jwt, JWTError
+from config import settings
+
+def create_access_token(user_id: int) -> str:
+    expire = datetime.utcnow() + timedelta(minutes=settings.access_token_expire_minutes)
+    payload = {"sub": str(user_id), "exp": expire, "iat": datetime.utcnow()}
+    return jwt.encode(payload, settings.secret_key, algorithm=settings.algorithm)
+
+def decode_jwt_token(token: str) -> dict | None:
+    try:
+        return jwt.decode(token, settings.secret_key, algorithms=[settings.algorithm])
+    except JWTError:
+        return None
+```
+
+### Passwords
+
+- Use `passlib` with `bcrypt` as the hashing scheme. Never use `hashlib` or MD5/SHA for passwords.
+- Always hash passwords before storing in the database. Never store plaintext.
+- Never return the `hashed_password` field in any API response under any circumstances.
+
+```python
+from passlib.context import CryptContext
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+def hash_password(plain: str) -> str:
+    return pwd_context.hash(plain)
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+```
+
+- Pydantic response schemas for users must never include a `password` or `hashed_password` field
+- SQLAlchemy `User` model may contain `hashed_password` column — it must never appear in any schema in `schemas/`
+
+```python
+# schemas/auth.py — CORRECT
+class UserPublic(BaseModel):
+    id: int
+    email: str
+    # NO password field here, ever
+```
+
+### Protected Routes
+
+Annotate all protected routes explicitly with the `get_current_user` dependency:
+
+```python
+@router.get("/protected-resource", response_model=APIResponse)
+def protected(current_user = Depends(get_current_user)):
+    return success({"user_id": current_user.id})
+```
+
+Never protect routes with a manual token check inline. Always use the dependency.
+
+---
+
+## Error Handling
+
+Raise `HTTPException` for all client errors. Never return 200 with an error message buried in the body.
+
+```python
+from fastapi import HTTPException, status
+
+raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Repos not found")
+raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
+raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Invalid input")
+```
+
+Add a global exception handler in `main.py` to catch unhandled exceptions and return them in the standard envelope:
+
+```python
+from fastapi import Request
+from fastapi.responses import JSONResponse
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    return JSONResponse(
+        status_code=500,
+        content={"data": None, "error": "An internal server error occurred"}
+    )
+```
+
+---
+
+## CORS
+
+Configure CORS in `main.py` only. Never configure it inside a router.
+
+```python
+from fastapi.middleware.cors import CORSMiddleware
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000"],  # add Vercel URL in production
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+```
