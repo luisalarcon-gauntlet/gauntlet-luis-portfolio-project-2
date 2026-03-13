@@ -1,0 +1,383 @@
+---
+description: AI Test Driven Development — applied to every coding agent
+globs: ["**/*.py", "**/*.ts", "**/*.tsx"]
+alwaysApply: true
+---
+
+# AI TDD Rules — Luis Alarcon Portfolio
+
+These rules govern every coding action taken by an AI agent on this project.
+No implementation code is written before a failing test exists. No feature is
+considered done until `docker-compose up --build` exits green.
+
+---
+
+## The Four Laws (never break these)
+
+### Law 1 — Test first, watch it fail
+
+Write the test. Run it. Confirm it fails with the **right reason** (not a
+syntax error, not a missing import — the actual assertion failure that proves
+the feature does not exist yet). Only then write implementation code.
+
+```
+# WRONG — writing code first
+def get_repos(): ...          # implementation written speculatively
+def test_get_repos(): ...     # test written afterward to match code
+
+# RIGHT — test first
+def test_get_repos_returns_list_sorted_by_updated_at(): ...   # RED
+def get_repos(): ...          # implementation written to satisfy test
+```
+
+### Law 2 — Write the minimum code to pass
+
+Do not add logic that is not exercised by the currently failing test.
+No defensive branches, no extra fields, no "while I'm here" refactors.
+If the test passes with a hardcoded return value, ship the hardcoded value
+and write the next test that forces the real implementation.
+
+### Law 3 — Docker must be green before moving on
+
+After every test/implementation cycle run:
+
+```
+docker-compose up --build
+```
+
+All containers must reach healthy/exit-0 status. If any container fails,
+fix it before writing the next test. Never carry forward a broken build.
+
+### Law 4 — One test per feature, happy path only (v1)
+
+Each new feature gets exactly one test covering the primary success path.
+Enumerate what is intentionally NOT tested at the bottom of every test file
+(see the NOT COVERED section format below).
+
+---
+
+## Naming Rules
+
+Test names must describe **observable behavior**, not internal implementation.
+
+| ❌ Implementation name | ✅ Behavior name |
+|---|---|
+| `test_fetch_function` | `test_projects_grid_shows_repo_name_and_description` |
+| `test_api_call` | `test_backend_returns_repos_sorted_by_most_recently_updated` |
+| `test_cache_logic` | `test_cached_response_is_served_when_github_api_is_unavailable` |
+| `test_component_render` | `test_hero_section_displays_name_and_github_link` |
+| `test_db_insert` | `test_repo_data_is_persisted_to_postgres_after_first_fetch` |
+
+The test name is the specification. A non-engineer must be able to read the
+test name and understand exactly what the user experiences.
+
+---
+
+## Backend Rules (FastAPI + pytest + httpx)
+
+### Stack
+
+- **pytest** — test runner
+- **httpx.AsyncClient** — call the real FastAPI app
+- **Postgres running in Docker** — no mocking the database
+- **respx** — mock outbound GitHub API HTTP calls only (to avoid rate limits
+  in CI); never mock the FastAPI app itself or the database
+
+### Test file location
+
+```
+backend/
+  tests/
+    test_repos.py
+    test_cache.py
+    test_health.py
+```
+
+### Test structure template
+
+```python
+# backend/tests/test_repos.py
+
+import pytest
+import httpx
+from app.main import app  # real FastAPI app
+
+# ---------------------------------------------------------------------------
+# FEATURE: Projects grid — fetch and return public repos
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_repos_endpoint_returns_list_sorted_by_most_recently_updated():
+    """
+    When GET /api/repos is called the response must be a JSON array
+    where each item has name, description, language, topics, stars,
+    updated_at, and html_url. Items are ordered newest-updated first.
+    """
+    async with httpx.AsyncClient(app=app, base_url="http://test") as client:
+        response = await client.get("/api/repos")
+
+    assert response.status_code == 200
+    repos = response.json()
+    assert isinstance(repos, list)
+    assert len(repos) > 0
+
+    first = repos[0]
+    assert "name" in first
+    assert "description" in first
+    assert "language" in first
+    assert "topics" in first
+    assert "stars" in first
+    assert "updated_at" in first
+    assert "html_url" in first
+
+    # sorted newest first
+    dates = [r["updated_at"] for r in repos]
+    assert dates == sorted(dates, reverse=True)
+
+
+# ---------------------------------------------------------------------------
+# NOT COVERED IN THIS FILE — intentional v1 exclusions
+# ---------------------------------------------------------------------------
+# - GitHub API returning 403 / rate-limit exceeded
+# - GitHub API returning 500
+# - Malformed JSON from GitHub API
+# - Repos with null description or null language
+# - Pagination (> 100 repos)
+# - Cache expiry / TTL enforcement
+# - Concurrent requests hitting the cache simultaneously (race condition)
+# - Performance: response time under load
+# - Security: GitHub token exposure in logs
+# - Security: CORS misconfiguration
+# ---------------------------------------------------------------------------
+```
+
+### Backend TDD cycle (follow exactly)
+
+```
+1. Write test → run pytest → confirm RED (AssertionError on the right line)
+2. Write minimum FastAPI route / service code
+3. Run pytest → confirm GREEN
+4. Run docker-compose up --build → confirm all containers green
+5. Move to next feature
+```
+
+### Database rule
+
+Tests run against the **real Postgres container** defined in
+`docker-compose.yml`. Use a separate `test` database schema or a
+pytest fixture that truncates tables before each test. Never use
+SQLite as a test substitute.
+
+```python
+# conftest.py
+import pytest
+from sqlalchemy import text
+from app.database import engine
+
+@pytest.fixture(autouse=True)
+async def clean_db():
+    async with engine.begin() as conn:
+        await conn.execute(text("TRUNCATE TABLE repo_cache RESTART IDENTITY"))
+    yield
+```
+
+---
+
+## Frontend Rules (Next.js + React Testing Library)
+
+### Stack
+
+- **Vitest** or **Jest** — test runner
+- **React Testing Library (RTL)** — query by what the user sees
+- **MSW (Mock Service Worker)** — intercept `/api/repos` fetch calls
+- Never test implementation details (state variables, function names,
+  component internals)
+
+### Test file location
+
+```
+frontend/
+  __tests__/
+    hero.test.tsx
+    projects-grid.test.tsx
+    about.test.tsx
+```
+
+### Test structure template
+
+```tsx
+// frontend/__tests__/projects-grid.test.tsx
+
+import { render, screen, waitFor } from "@testing-library/react"
+import { rest } from "msw"
+import { setupServer } from "msw/node"
+import ProjectsGrid from "@/components/ProjectsGrid"
+
+const MOCK_REPOS = [
+  {
+    name: "ai-portfolio",
+    description: "Personal portfolio with GitHub API integration",
+    language: "TypeScript",
+    topics: ["nextjs", "fastapi"],
+    stars: 4,
+    updated_at: "2024-05-01T12:00:00Z",
+    html_url: "https://github.com/luisalarcon-gauntlet/ai-portfolio",
+  },
+]
+
+const server = setupServer(
+  rest.get("/api/repos", (_req, res, ctx) => res(ctx.json(MOCK_REPOS)))
+)
+
+beforeAll(() => server.listen())
+afterEach(() => server.resetHandlers())
+afterAll(() => server.close())
+
+// ---------------------------------------------------------------------------
+// FEATURE: Projects grid renders repo cards from API data
+// ---------------------------------------------------------------------------
+
+test("projects grid shows repo name description language tag and github link", async () => {
+  render(<ProjectsGrid />)
+
+  // user sees loading state first (optional but honest)
+  // then sees real content
+  await waitFor(() => {
+    expect(screen.getByText("ai-portfolio")).toBeInTheDocument()
+  })
+
+  expect(
+    screen.getByText("Personal portfolio with GitHub API integration")
+  ).toBeInTheDocument()
+
+  expect(screen.getByText("TypeScript")).toBeInTheDocument()
+
+  const link = screen.getByRole("link", { name: /ai-portfolio/i })
+  expect(link).toHaveAttribute(
+    "href",
+    "https://github.com/luisalarcon-gauntlet/ai-portfolio"
+  )
+})
+
+// ---------------------------------------------------------------------------
+// NOT COVERED IN THIS FILE — intentional v1 exclusions
+// ---------------------------------------------------------------------------
+// - API returns empty array (empty state UI)
+// - API returns network error (error boundary)
+// - More than 30 repos (scroll / pagination)
+// - Topics/tags overflow wrapping on small screens
+// - Accessibility: keyboard navigation through cards
+// - Accessibility: screen reader announces repo count
+// - Dark theme color contrast ratios
+// - Mobile viewport card layout
+// - Loading skeleton animation timing
+// - Performance: render time with 100+ cards
+// ---------------------------------------------------------------------------
+```
+
+### RTL query priority (in this order)
+
+1. `getByRole` — always preferred (accessible)
+2. `getByLabelText`
+3. `getByText`
+4. `getByTestId` — last resort only, add comment explaining why
+
+### What RTL tests must NOT do
+
+```tsx
+// WRONG — testing implementation
+expect(wrapper.state().isLoading).toBe(false)
+expect(component.find("ProjectCard").length).toBe(3)
+expect(mockFetch).toHaveBeenCalledWith("/api/repos")  // internal detail
+
+// RIGHT — testing what the user sees
+expect(screen.getByText("ai-portfolio")).toBeInTheDocument()
+expect(screen.getAllByRole("article")).toHaveLength(3)
+expect(screen.getByRole("link", { name: /view on github/i })).toBeVisible()
+```
+
+---
+
+## Complexity Rule
+
+> If the test is hard to write, the code is too complex. Simplify the code.
+
+Signs a test is hard to write and what to do:
+
+| Symptom | Diagnosis | Fix |
+|---|---|---|
+| Need to mock 3+ things | Function does too much | Split into smaller functions |
+| Test setup is longer than the assertion | Too many dependencies | Inject dependencies, simplify interface |
+| Can't figure out what to assert | No clear return value or side effect | Make the function return something observable |
+| Test requires deep knowledge of internals | Logic is buried | Move logic to a pure function, test that |
+| Need to import half the app | Circular dependencies | Restructure modules |
+
+For this project specifically:
+- `GET /api/repos` must be testable by calling one endpoint and asserting one
+  JSON shape — if it requires more, the service layer is too coupled
+- `ProjectsGrid` must be testable by rendering it with mocked API data and
+  asserting visible text — if it requires more, extract data-fetching from
+  rendering
+
+---
+
+## Feature → Test Mapping (v1 scope)
+
+Every feature listed in the project brief maps to exactly one test.
+
+| Feature | Test file | Test name |
+|---|---|---|
+| Backend health | `test_health.py` | `test_health_endpoint_returns_ok` |
+| Fetch repos from GitHub | `test_repos.py` | `test_repos_endpoint_returns_list_sorted_by_most_recently_updated` |
+| Cache repos in Postgres | `test_cache.py` | `test_repo_data_is_persisted_to_postgres_after_first_fetch` |
+| Serve from cache | `test_cache.py` | `test_cached_response_is_served_when_github_api_is_unavailable` |
+| Hero section renders | `hero.test.tsx` | `hero section displays name title bio github link and linkedin link` |
+| Projects grid renders | `projects-grid.test.tsx` | `projects grid shows repo name description language tag and github link` |
+| About section renders | `about.test.tsx` | `about section displays gauntlet ai program background and resume link` |
+| Contact section renders | `contact.test.tsx` | `contact section shows email link github link and linkedin link` |
+
+---
+
+## NOT COVERED — Project-Wide Exclusions (v1)
+
+The following are explicitly out of scope for v1. They must not be tested now,
+but every test file must reference this list so future agents know what remains.
+
+### Error & edge cases
+- GitHub API rate limit hit (60 req/hour unauthenticated)
+- GitHub API returns 4xx or 5xx
+- Repo with null `description`, null `language`, or empty `topics`
+- Repo count exceeds GitHub default page size (30) or max (100)
+- Network timeout between backend and GitHub API
+- Postgres connection failure on startup
+- Docker volume data corruption
+
+### Performance
+- Response time for `/api/repos` under concurrent load
+- Frontend time-to-interactive with 50+ repo cards
+- Cache query performance without index on `updated_at`
+- Next.js bundle size budget
+
+### Security
+- GitHub token (if added later) must not appear in logs or API responses
+- CORS policy enforcement
+- SQL injection via query parameters
+- Rate limiting on the FastAPI backend itself
+- Secrets in Docker environment variables leaking to frontend
+
+### Accessibility
+- Keyboard navigation through the projects grid
+- Screen reader announcements for dynamic content
+- Color contrast ratios in dark theme
+- Focus management
+
+### Mobile / responsive
+- Card layout on screens < 375px wide
+- Touch target sizes
+- Horizontal scroll on topic tags
+
+### Operational
+- Cache TTL expiry and re-fetch logic
+- Graceful degradation when cache is empty and GitHub is down
+- Zero-downtime redeployment on Vercel
+- Docker container restart policy under failure
