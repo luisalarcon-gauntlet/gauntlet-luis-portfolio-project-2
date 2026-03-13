@@ -6,9 +6,9 @@ from datetime import datetime, timedelta
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import settings
 from app.db.session import get_db
 from app.services import github_service
-from app.core.config import settings
 
 router = APIRouter(prefix="/profile", tags=["profile"])
 
