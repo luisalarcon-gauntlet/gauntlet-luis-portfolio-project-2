@@ -1,0 +1,354 @@
+---
+description: Next.js frontend conventions
+globs: ["frontend/**/*.ts", "frontend/**/*.tsx"]
+alwaysApply: true
+---
+
+# Next.js Frontend Rules — Luis Alarcon Portfolio
+
+## App Router File Structure
+
+Follow the Next.js 14+ App Router conventions strictly:
+
+```
+frontend/
+├── app/
+│   ├── layout.tsx          # Root layout — wraps all pages, mounts AuthContext
+│   ├── page.tsx            # Home page — Hero + Projects + About + Contact
+│   ├── loading.tsx         # Root loading UI (Suspense boundary)
+│   ├── error.tsx           # Root error boundary
+│   └── globals.css
+├── components/
+│   ├── ui/                 # Primitive, stateless UI components
+│   ├── hero/
+│   ├── projects/
+│   ├── about/
+│   └── contact/
+├── lib/
+│   └── api.ts              # ← ALL backend API calls live here, nowhere else
+├── context/
+│   └── auth-context.tsx    # JWT auth context (even if auth is not v1 scope)
+├── types/
+│   └── index.ts            # All shared TypeScript types and interfaces
+└── hooks/
+    └── use-repositories.ts # Example data-fetching hook
+```
+
+- Use `page.tsx`, `layout.tsx`, `loading.tsx`, `error.tsx` naming — no deviations.
+- Do not use the `pages/` directory. App Router only.
+- Co-locate component files with their section folder, not in a flat `/components` root dump.
+- Server Components are the default. Mark client components explicitly with `"use client"` only when needed (interactivity, hooks, browser APIs).
+
+---
+
+## No Mock Data — Ever
+
+**Never use hardcoded mock data, static JSON fixtures, or placeholder arrays in any component or hook.**
+
+- Every data value rendered in the UI must come from a real API response originating from the FastAPI backend.
+- The backend proxies GitHub API calls and handles caching against Postgres — the frontend does not call `api.github.com` directly.
+- If the backend is unavailable during development, fix the backend. Do not patch the frontend with fake data.
+- Test components with the real dev backend running via `docker-compose up`.
+
+```typescript
+// ❌ NEVER do this
+const repos = [
+  { id: 1, name: "fake-repo", description: "placeholder" }
+];
+
+// ✅ Always do this
+const { data: repos, isLoading, error } = useRepositories();
+```
+
+---
+
+## All API Calls Go Through `/lib/api.ts`
+
+**`/lib/api.ts` is the single source of truth for all HTTP communication with the backend.**
+
+- No `fetch()` calls outside of `/lib/api.ts`.
+- No `axios` instances defined outside of `/lib/api.ts`.
+- No inline URLs or hardcoded `localhost:8000` strings in components or hooks.
+- Hooks in `/hooks/` call functions exported from `/lib/api.ts`. Components call hooks.
+
+```typescript
+// lib/api.ts — canonical shape
+
+const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
+
+async function apiFetch<T>(path: string, options?: RequestInit): Promise<T> {
+  const res = await fetch(`${API_BASE_URL}${path}`, {
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options?.headers,
+    },
+  });
+
+  if (!res.ok) {
+    throw new Error(`API error ${res.status}: ${path}`);
+  }
+
+  return res.json() as Promise<T>;
+}
+
+export async function getRepositories(): Promise<Repository[]> {
+  return apiFetch<Repository[]>("/api/repositories");
+}
+
+export async function getRepository(name: string): Promise<Repository> {
+  return apiFetch<Repository>(`/api/repositories/${name}`);
+}
+```
+
+- All functions in `api.ts` must be explicitly typed — return types are never inferred as `any`.
+- Add new API functions here as new backend endpoints are added. Never inline them at the call site.
+
+---
+
+## Loading and Error States Required on Every Fetch
+
+**Every component or page that fetches data must handle three states: loading, error, and success. No exceptions.**
+
+This applies even though v1 targets the happy path. The structure must be in place.
+
+```typescript
+// hooks/use-repositories.ts
+"use client";
+
+import { useEffect, useState } from "react";
+import { getRepositories } from "@/lib/api";
+import type { Repository } from "@/types";
+
+interface UseRepositoriesResult {
+  data: Repository[] | null;
+  isLoading: boolean;
+  error: string | null;
+}
+
+export function useRepositories(): UseRepositoriesResult {
+  const [data, setData] = useState<Repository[] | null>(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function load() {
+      try {
+        setIsLoading(true);
+        setError(null);
+        const repos = await getRepositories();
+        if (!cancelled) setData(repos);
+      } catch (err) {
+        if (!cancelled) setError(err instanceof Error ? err.message : "Failed to load repositories");
+      } finally {
+        if (!cancelled) setIsLoading(false);
+      }
+    }
+
+    load();
+    return () => { cancelled = true; };
+  }, []);
+
+  return { data, isLoading, error };
+}
+```
+
+```tsx
+// components/projects/projects-grid.tsx
+"use client";
+
+import { useRepositories } from "@/hooks/use-repositories";
+
+export function ProjectsGrid() {
+  const { data: repos, isLoading, error } = useRepositories();
+
+  // ✅ Loading state — required
+  if (isLoading) {
+    return <ProjectsGridSkeleton />;
+  }
+
+  // ✅ Error state — required
+  if (error) {
+    return (
+      <p className="text-red-500 text-sm">
+        Could not load repositories. {error}
+      </p>
+    );
+  }
+
+  // ✅ Success state
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+      {repos?.map((repo) => (
+        <ProjectCard key={repo.id} repo={repo} />
+      ))}
+    </div>
+  );
+}
+```
+
+- Use skeleton components for loading states — not spinners alone, not `"Loading..."` text.
+- Error messages must be human-readable. Include the raw error only in development.
+- Never render `null` silently when a fetch fails — always surface something to the user.
+
+---
+
+## Auth Context at Root Layout
+
+Even though authentication is out of scope for v1, the `AuthContext` provider must be mounted at the root layout so it is available globally without refactoring when auth is added.
+
+```tsx
+// app/layout.tsx
+import { AuthProvider } from "@/context/auth-context";
+
+export default function RootLayout({ children }: { children: React.ReactNode }) {
+  return (
+    <html lang="en">
+      <body>
+        <AuthProvider>
+          {children}
+        </AuthProvider>
+      </body>
+    </html>
+  );
+}
+```
+
+```tsx
+// context/auth-context.tsx
+"use client";
+
+import { createContext, useContext, useState, ReactNode } from "react";
+
+interface AuthState {
+  token: string | null;
+  isAuthenticated: boolean;
+  login: (token: string) => void;
+  logout: () => void;
+}
+
+const AuthContext = createContext<AuthState | null>(null);
+
+export function AuthProvider({ children }: { children: ReactNode }) {
+  const [token, setToken] = useState<string | null>(null);
+
+  function login(newToken: string) {
+    setToken(newToken); // stored in memory only — see JWT rule below
+  }
+
+  function logout() {
+    setToken(null);
+  }
+
+  return (
+    <AuthContext.Provider value={{ token, isAuthenticated: !!token, login, logout }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth(): AuthState {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be used inside AuthProvider");
+  return ctx;
+}
+```
+
+---
+
+## JWT Stored in Memory Only — Never localStorage or Cookies
+
+**JWTs must be stored exclusively in React state (in-memory). No `localStorage`, no `sessionStorage`, no `document.cookie` writes from the frontend.**
+
+- Tokens live in `AuthContext` state and are lost on page refresh — this is intentional for this project's security posture.
+- Do not persist tokens across sessions unless explicitly required by a future spec change.
+- When attaching tokens to requests, read from context or pass as argument — never read from `window.localStorage`.
+
+```typescript
+// ❌ NEVER do this
+localStorage.setItem("jwt", token);
+const token = localStorage.getItem("jwt");
+
+// ✅ Correct — token lives in AuthContext state only
+const { token } = useAuth();
+```
+
+```typescript
+// lib/api.ts — attach token from memory when needed
+export async function getProtectedResource(token: string): Promise<ProtectedData> {
+  return apiFetch<ProtectedData>("/api/protected", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+}
+```
+
+---
+
+## TypeScript Strict Mode — No `any` Types
+
+`tsconfig.json` must have strict mode enabled:
+
+```json
+{
+  "compilerOptions": {
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noUncheckedIndexedAccess": true
+  }
+}
+```
+
+**Rules:**
+
+- `any` is banned. Use `unknown` for values of indeterminate type, then narrow explicitly.
+- All function parameters and return types must be explicitly annotated or clearly inferrable — no implicit `any` from missing types.
+- All shared types live in `/types/index.ts`. Do not define one-off inline types in component files.
+- API response shapes must be typed before use — define the type in `/types/index.ts`, pass it as the generic to `apiFetch<T>`.
+
+```typescript
+// types/index.ts
+
+export interface Repository {
+  id: number;
+  name: string;
+  description: string | null;
+  html_url: string;
+  language: string | null;
+  topics: string[];
+  stargazers_count: number;
+  updated_at: string;
+  pushed_at: string;
+}
+```
+
+```typescript
+// ❌ NEVER
+const data: any = await res.json();
+
+// ✅ Correct
+const data: Repository[] = await apiFetch<Repository[]>("/api/repositories");
+```
+
+- Use `type` for unions and utility types. Use `interface` for object shapes and API contracts.
+- ESLint rule `@typescript-eslint/no-explicit-any` must be set to `"error"`.
+
+---
+
+## What Is Deferred (Out of Scope for v1)
+
+The following are explicitly **not** implemented in v1. Do not add code, stubs, or partial implementations for these unless the spec is updated.
+
+| Feature | Reason Deferred |
+|---|---|
+| **Mobile-specific layouts** | Responsive CSS via Tailwind breakpoints is sufficient for v1. Native mobile app or PWA work is out of scope. |
+| **Animations and transitions** | Framer Motion or CSS keyframe animations are not added in v1. Static renders only. Simple hover states via Tailwind are acceptable. |
+| **Accessibility (a11y) audit** | Semantic HTML and alt text on images are required baseline. Full WCAG 2.1 AA audit, screen reader testing, and focus management polish are deferred. |
+| **Dark mode toggle** | The site uses a dark theme as Luis's default brand. A user-togglable light/dark mode switch is not built in v1. No `next-themes` or `prefers-color-scheme` switching logic. |
+| **Analytics** | No tracking scripts, event logging, or third-party analytics integrations (e.g., Vercel Analytics, Plausible) in v1. |
+| **Authentication / Admin panel** | No login flows, protected routes, or content management UI in v1. Auth context is stubbed at root layout only as an architectural placeholder. |
+| **Blog or writing section** | Not in scope. No MDX, CMS, or content pipeline. |
+| **Custom domain setup** | Deployment targeting Vercel default domain. Custom DNS configuration is out of scope. |
+| **Complex error recovery** | No retry logic, offline detection, or error reporting services (e.g., Sentry) in v1. Surface the error message and stop. |
