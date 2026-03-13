@@ -1,0 +1,242 @@
+---
+description: Core architecture rules for every project
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# Architecture Rules — Luis Alarcon Personal Portfolio
+
+## Stack (Locked — Do Not Deviate)
+
+- **Frontend**: Next.js 14 (App Router), React 18, TypeScript — no Pages Router, no JS
+- **Backend**: FastAPI (Python 3.11) — proxies GitHub API, handles caching logic
+- **Database**: PostgreSQL 15 — stores cached GitHub API responses only
+- **Infrastructure**: Docker + docker-compose — every service runs in a container
+- **Auth**: JWT only if auth is ever needed — not in scope for v1, do not add it
+- **Styling**: Tailwind CSS — dark theme, no CSS-in-JS, no styled-components
+- **HTTP Client (frontend)**: Native `fetch` only — no axios, no react-query in v1
+- **HTTP Client (backend)**: `httpx` — already in FastAPI ecosystem, nothing else
+- **ORM**: SQLAlchemy 2.x with raw SQL fallback — no Prisma, no Tortoise
+
+---
+
+## Monorepo Structure (Exact Folder Names)
+
+```
+portfolio/
+├── frontend/                  # Next.js App Router application
+│   ├── app/
+│   │   ├── layout.tsx
+│   │   ├── page.tsx           # Single page — Hero + Projects + About + Contact
+│   │   └── components/
+│   │       ├── Hero.tsx
+│   │       ├── ProjectsGrid.tsx
+│   │       ├── ProjectCard.tsx
+│   │       ├── About.tsx
+│   │       └── Contact.tsx
+│   ├── public/
+│   ├── Dockerfile
+│   ├── next.config.ts
+│   ├── tailwind.config.ts
+│   └── package.json
+│
+├── backend/                   # FastAPI application
+│   ├── app/
+│   │   ├── main.py            # FastAPI entry point
+│   │   ├── routes/
+│   │   │   └── repos.py       # /api/repos endpoint
+│   │   ├── services/
+│   │   │   └── github.py      # GitHub API fetch logic
+│   │   ├── db/
+│   │   │   ├── database.py    # SQLAlchemy engine + session
+│   │   │   └── models.py      # RepoCache model
+│   │   └── schemas/
+│   │       └── repo.py        # Pydantic response models
+│   ├── Dockerfile
+│   └── requirements.txt
+│
+├── docker-compose.yml         # Single source of truth for running everything
+└── README.md
+```
+
+No additional top-level folders. No `packages/`, no `libs/`, no `shared/` unless explicitly required by a future feature.
+
+---
+
+## Service Responsibilities (Hard Boundaries)
+
+- **Frontend** fetches from backend only — never calls GitHub API directly
+- **Backend** owns all GitHub API communication and all caching decisions
+- **Postgres** stores only one thing: cached GitHub repo responses with a timestamp
+- **docker-compose** wires all three services — `frontend`, `backend`, `db`
+
+---
+
+## What Is Forbidden
+
+### Architecture
+- No microservices — one backend service, period
+- No message queues (Redis, RabbitMQ, Kafka) — not needed
+- No GraphQL — REST only
+- No BFF (Backend for Frontend) pattern — backend IS the only API
+- No serverless functions inside this repo — Vercel edge functions are out of scope
+
+### Code Patterns
+- No abstract base classes or factory patterns unless solving a real, present problem
+- No service locators, dependency injection containers, or plugin systems
+- No over-abstraction — if a function is only called once, do not extract it to a utility
+- No generic CRUD scaffolding — only build the endpoints this project needs
+- No `TODO` comments shipped as placeholders for real logic
+
+### Data
+- No mock data, no seed files with fake repos, no hardcoded project lists
+- No fallback static JSON if GitHub API is down — cache in Postgres handles this
+- The GitHub username is `luisalarcon-gauntlet` — hardcode it in backend config, not in frontend
+
+### Dependencies
+- Frontend: no axios, no react-query, no Redux, no Zustand, no SWR
+- Backend: no Celery, no Redis, no Alembic migrations for v1 (use `create_all`), no FastAPI-Users
+- Do not add a dependency to solve a problem that 10 lines of code can solve
+
+---
+
+## Dependency Rules
+
+### Frontend `package.json` — Allowed
+```
+next, react, react-dom, typescript, tailwindcss, postcss, autoprefixer, @types/react, @types/node
+```
+Nothing else without explicit approval.
+
+### Backend `requirements.txt` — Allowed
+```
+fastapi, uvicorn[standard], httpx, sqlalchemy, psycopg2-binary, pydantic, python-dotenv
+```
+Nothing else without explicit approval.
+
+---
+
+## Caching Rules (Core to This Project)
+
+- GitHub unauthenticated API rate limit is 60 req/hour — caching is not optional
+- Backend checks Postgres before calling GitHub API
+- Cache TTL: **60 minutes** — if cached data is less than 60 minutes old, return it, skip GitHub
+- Cache is stored as a single JSON blob in a `repo_cache` table with a `fetched_at` timestamp
+- On cache miss or expired cache: call GitHub API, overwrite cache row, return fresh data
+- This is the entire caching strategy — do not add Redis, do not add in-memory LRU cache
+
+```sql
+-- repo_cache table shape
+id          SERIAL PRIMARY KEY
+data        JSONB NOT NULL          -- full array of repo objects
+fetched_at  TIMESTAMP NOT NULL
+```
+
+---
+
+## GitHub API Integration Rules
+
+- Target endpoint: `GET https://api.github.com/users/luisalarcon-gauntlet/repos?per_page=100&sort=updated`
+- Pinned repos endpoint: `GET https://api.github.com/users/luisalarcon-gauntlet/repos` (sort by pushed_at, handle pinned client-side by starring logic or updated order)
+- Backend exposes exactly one endpoint to frontend: `GET /api/repos`
+- Response shape must include per repo: `name`, `description`, `html_url`, `language`, `topics`, `stargazers_count`, `updated_at`
+- Strip all other fields before sending to frontend — do not proxy raw GitHub response
+
+---
+
+## API Contract (Frontend ↔ Backend)
+
+```
+GET /api/repos
+Response 200:
+{
+  "repos": [
+    {
+      "name": string,
+      "description": string | null,
+      "html_url": string,
+      "language": string | null,
+      "topics": string[],
+      "stargazers_count": number,
+      "updated_at": string  // ISO 8601
+    }
+  ],
+  "cached": boolean,
+  "fetched_at": string  // ISO 8601
+}
+
+GET /api/health
+Response 200: { "status": "ok" }
+```
+
+No other endpoints in v1.
+
+---
+
+## docker-compose Rules
+
+- `docker-compose.yml` at repo root is the only way to run the full stack
+- All three services must start with `docker-compose up` — no manual steps
+- Services:
+  - `db`: postgres:15-alpine, volume-mounted, health check required
+  - `backend`: built from `./backend/Dockerfile`, depends_on `db`, port 8000
+  - `frontend`: built from `./frontend/Dockerfile`, depends_on `backend`, port 3000
+- Environment variables passed via `environment:` block in docker-compose — no `.env` files committed
+- Backend `DATABASE_URL` and `GITHUB_USERNAME` must be env vars, not hardcoded in Python files
+- Frontend `NEXT_PUBLIC_API_URL` must point to `http://backend:8000` inside Docker network
+
+---
+
+## Build Order — Happy Path First
+
+Build in this exact order. Do not move to the next step until the current one works end-to-end.
+
+1. **docker-compose + Postgres** — `db` service starts, accepts connections, health check passes
+2. **FastAPI skeleton** — `GET /api/health` returns 200, backend container starts cleanly
+3. **GitHub API fetch** — backend calls GitHub, returns raw repo data (no cache yet)
+4. **Postgres caching** — cache miss/hit logic works, `repo_cache` table created on startup
+5. **`GET /api/repos` endpoint** — returns stripped, shaped response per contract above
+6. **Next.js project scaffold** — `frontend` container starts, renders blank page at `localhost:3000`
+7. **Projects grid** — fetches `/api/repos`, renders cards with name, description, language, tags, stars, date, link
+8. **Hero section** — static: name, title, bio, GitHub link, LinkedIn link
+9. **About section** — static: short paragraph, resume download link
+10. **Contact section** — static: email link, GitHub, LinkedIn
+11. **Dark theme + responsive layout** — Tailwind dark theme applied across all sections
+12. **Full `docker-compose up` smoke test** — all three containers healthy, page loads, repos display
+
+---
+
+## Page Structure Rules
+
+- Single page application — one route `/`, all sections on one page
+- Section order top to bottom: Hero → Projects Grid → About → Contact
+- No routing needed in v1 — no `app/projects/[slug]/` pages
+- Projects sorted by `updated_at` descending — most recent first
+- No pagination in v1 — render all public repos
+- Project cards show: repo name (bold), description (muted), language badge, topic tags (up to 5), star count, last updated, "View on GitHub" link
+
+---
+
+## What NOT to Build in v1
+
+- No admin panel, no auth, no login
+- No blog section
+- No analytics (no Google Analytics, no Vercel Analytics)
+- No contact form — email link only
+- No custom domain configuration
+- No complex error boundary UI — if the API fails, show nothing or a single line of text
+- No loading skeletons — a simple loading state or nothing is fine
+- No unit tests, no e2e tests — ship working code first
+- No CI/CD pipeline — out of scope
+- No dark/light mode toggle — dark only
+
+---
+
+## Code Quality Rules
+
+- Every file has a single, obvious responsibility
+- No files over 200 lines — split before you reach it
+- No `any` types in TypeScript — type everything from the API contract
+- Python functions do one thing — no god functions in `github.py` or `repos.py`
+- Comments explain *why*, not *what* — the code explains what
+- If something feels complicated, it is — simplify before committing
