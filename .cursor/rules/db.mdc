@@ -1,0 +1,290 @@
+---
+description: Postgres and SQLAlchemy conventions
+globs: ["backend/models/**/*.py", "db/**/*.py"]
+alwaysApply: true
+---
+
+# Postgres & SQLAlchemy Rules
+
+## Primary Keys
+
+- All tables **must** use UUID primary keys generated server-side.
+- Use `uuid.uuid4` as the default factory — never auto-increment integers.
+- Column name is always `id`.
+
+```python
+import uuid
+from sqlalchemy import Column
+from sqlalchemy.dialects.postgresql import UUID
+
+id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4, nullable=False)
+```
+
+## Naming Conventions
+
+- All table names: `snake_case`, plural (e.g., `github_repos`, `cached_responses`).
+- All column names: `snake_case` (e.g., `updated_at`, `star_count`, `repo_name`).
+- All SQLAlchemy model class names: `PascalCase` singular (e.g., `GithubRepo`).
+- Foreign key columns: `<referenced_table_singular>_id` (e.g., `repo_id`).
+- Index names: `ix_<table>_<column>` (e.g., `ix_github_repos_updated_at`).
+- Unique constraint names: `uq_<table>_<column>` (e.g., `uq_github_repos_github_id`).
+
+## Timestamp Conventions
+
+- Every table **must** include `created_at` and `updated_at` columns.
+- Both columns are `TIMESTAMP WITH TIME ZONE` (timezone-aware), never naive datetimes.
+- `created_at` defaults to `func.now()` and is never updated after insert.
+- `updated_at` defaults to `func.now()` and uses an `onupdate` trigger via SQLAlchemy.
+- Never set these columns manually in application code — let the defaults handle them.
+
+## Base Model and TimestampMixin
+
+All models **must** inherit from `Base` and `TimestampMixin`. Define them once in
+`backend/models/base.py` and import everywhere else.
+
+```python
+# backend/models/base.py
+
+import uuid
+from datetime import datetime
+
+from sqlalchemy import Column, DateTime, func
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import DeclarativeBase
+
+
+class Base(DeclarativeBase):
+    """Project-wide SQLAlchemy declarative base. All models inherit from this."""
+    pass
+
+
+class TimestampMixin:
+    """
+    Adds created_at and updated_at columns to any model.
+    Both are timezone-aware. updated_at refreshes automatically on UPDATE.
+    """
+
+    created_at: datetime = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+
+    updated_at: datetime = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )
+
+
+class UUIDMixin:
+    """
+    Adds a UUID primary key column named `id`.
+    Use alongside TimestampMixin on every model.
+    """
+
+    id: uuid.UUID = Column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        nullable=False,
+    )
+```
+
+### Example Model Usage
+
+```python
+# backend/models/github_repo.py
+
+from sqlalchemy import Column, Integer, String, Text
+from sqlalchemy.dialects.postgresql import ARRAY
+
+from backend.models.base import Base, TimestampMixin, UUIDMixin
+
+
+class GithubRepo(Base, UUIDMixin, TimestampMixin):
+    """
+    Cached representation of a public GitHub repository
+    for luisalarcon-gauntlet. Avoids repeated GitHub API calls.
+    """
+
+    __tablename__ = "github_repos"
+
+    github_id = Column(Integer, nullable=False, unique=True)  # uq_github_repos_github_id
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    html_url = Column(String(512), nullable=False)
+    primary_language = Column(String(100), nullable=True)
+    topics = Column(ARRAY(String), nullable=False, default=list)
+    stargazers_count = Column(Integer, nullable=False, default=0)
+    is_pinned = Column(Integer, nullable=False, default=0)  # 0 or 1; use for sort order
+    repo_updated_at = Column(String(64), nullable=True)  # raw ISO string from GitHub API
+```
+
+## SQLAlchemy Session Rules
+
+- Always use the **async** SQLAlchemy session (`AsyncSession`) — this project uses FastAPI.
+- Inject the session via FastAPI dependency injection; never create sessions manually in routes.
+- Session factory lives in `backend/db/session.py` — import from there only.
+- Always `await session.commit()` explicitly; never rely on implicit commits.
+- Use `await session.rollback()` in exception handlers before re-raising.
+
+```python
+# backend/db/session.py
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+from backend.core.config import settings
+
+engine = create_async_engine(
+    settings.database_url,  # postgresql+asyncpg://...
+    echo=False,
+    pool_pre_ping=True,
+)
+
+AsyncSessionLocal = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
+    autoflush=False,
+    autocommit=False,
+)
+
+
+async def get_db() -> AsyncSession:
+    """FastAPI dependency that yields a database session."""
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+```
+
+## No Raw SQL
+
+- **Never** use `session.execute(text("SELECT ..."))` for application queries.
+- **Never** write raw SQL strings anywhere in model or repository files.
+- Always use SQLAlchemy ORM `select()`, `insert()`, `update()`, `delete()` constructs.
+- For upserts (required for GitHub cache refresh), use `postgresql` dialect's `insert(...).on_conflict_do_update(...)`.
+
+```python
+# Correct — ORM upsert for GitHub repo cache refresh
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from backend.models.github_repo import GithubRepo
+
+async def upsert_repo(session: AsyncSession, repo_data: dict) -> None:
+    stmt = (
+        pg_insert(GithubRepo)
+        .values(**repo_data)
+        .on_conflict_do_update(
+            index_elements=["github_id"],
+            set_={
+                "name": repo_data["name"],
+                "description": repo_data["description"],
+                "stargazers_count": repo_data["stargazers_count"],
+                "topics": repo_data["topics"],
+                "primary_language": repo_data["primary_language"],
+                "repo_updated_at": repo_data["repo_updated_at"],
+                "updated_at": func.now(),
+            },
+        )
+    )
+    await session.execute(stmt)
+```
+
+## Alembic Migration Rules
+
+- Alembic lives in `db/migrations/`. Config file is `db/alembic.ini`.
+- **One migration per logical change** — do not bundle unrelated schema changes.
+- Migration file names must be descriptive: `alembic revision --autogenerate -m "add_github_repos_table"`.
+- **Never edit a migration file after it has been committed** to version control.
+  - If a mistake was made, create a new corrective migration.
+- Always review autogenerated migrations before committing — Alembic misses some changes
+  (e.g., `ARRAY` column defaults, custom types). Add them manually when needed.
+- Migrations run automatically on container startup via the entrypoint script:
+  `alembic upgrade head`.
+- Every migration must be reversible — always implement the `downgrade()` function.
+- Never call `Base.metadata.create_all()` in production or startup code — use Alembic only.
+
+```python
+# db/migrations/versions/001_add_github_repos_table.py  (example structure)
+
+def upgrade() -> None:
+    op.create_table(
+        "github_repos",
+        sa.Column("id", postgresql.UUID(as_uuid=True), primary_key=True),
+        sa.Column("github_id", sa.Integer(), nullable=False),
+        sa.Column("name", sa.String(255), nullable=False),
+        sa.Column("description", sa.Text(), nullable=True),
+        sa.Column("html_url", sa.String(512), nullable=False),
+        sa.Column("primary_language", sa.String(100), nullable=True),
+        sa.Column("topics", postgresql.ARRAY(sa.String()), nullable=False),
+        sa.Column("stargazers_count", sa.Integer(), nullable=False),
+        sa.Column("is_pinned", sa.Integer(), nullable=False),
+        sa.Column("repo_updated_at", sa.String(64), nullable=True),
+        sa.Column("created_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.Column("updated_at", sa.DateTime(timezone=True), server_default=sa.func.now(), nullable=False),
+        sa.UniqueConstraint("github_id", name="uq_github_repos_github_id"),
+    )
+    op.create_index("ix_github_repos_updated_at", "github_repos", ["updated_at"])
+
+
+def downgrade() -> None:
+    op.drop_index("ix_github_repos_updated_at", table_name="github_repos")
+    op.drop_table("github_repos")
+```
+
+## Seed Data Rules
+
+- Seed scripts live in `db/seeds/`.
+- Seeds **must be idempotent** — running them multiple times produces the same result.
+  Use upserts (`ON CONFLICT DO NOTHING` or `ON CONFLICT DO UPDATE`) — never plain inserts.
+- Seeds contain only **minimal, necessary data** — configuration rows or bootstrap records.
+  Do not seed fake project data; real data comes from the GitHub API at runtime.
+- Seeds run inside Docker via a dedicated service or as part of the `backend` entrypoint
+  after `alembic upgrade head`.
+- Never hardcode environment-specific values (hostnames, passwords) in seed files — read
+  from environment variables.
+- Seed scripts must be plain async Python using the project's `AsyncSessionLocal` — not
+  raw `psql` scripts.
+
+```python
+# db/seeds/seed_config.py  (example structure)
+
+import asyncio
+from sqlalchemy import text
+from backend.db.session import AsyncSessionLocal
+
+
+async def run_seeds() -> None:
+    """
+    Idempotent seed runner. Safe to call on every container startup.
+    Add seed functions here as needed.
+    """
+    async with AsyncSessionLocal() as session:
+        # Example: no seeds needed for v1 — data comes from GitHub API.
+        # Add config/reference rows here if required in future versions.
+        await session.commit()
+
+
+if __name__ == "__main__":
+    asyncio.run(run_seeds())
+```
+
+## General Rules Summary
+
+| Rule | Requirement |
+|---|---|
+| Primary key type | UUID v4, column named `id` |
+| Table naming | `snake_case`, plural |
+| Column naming | `snake_case` |
+| Timestamps | `created_at` + `updated_at`, timezone-aware, on every table |
+| Base class | Inherit `Base`, `UUIDMixin`, `TimestampMixin` |
+| Raw SQL | Forbidden — use ORM constructs only |
+| Upserts | `pg_insert(...).on_conflict_do_update(...)` |
+| Sessions | Async only, injected via FastAPI dependency |
+| Migrations | Alembic, one per change, never edit after commit |
+| Seeds | Idempotent, minimal, async Python, run in Docker |
